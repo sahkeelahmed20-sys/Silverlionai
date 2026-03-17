@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import type { CryptoPair, KlineData } from '@/types';
-// OrderBook type reserved for future order book implementation
 
 const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws';
 const BINANCE_API_URL = 'https://api.binance.com/api/v3';
@@ -20,14 +19,30 @@ export const CRYPTO_PAIRS = [
 
 export function useBinanceWebSocket() {
   const [prices, setPrices] = useState<Map<string, CryptoPair>>(new Map());
-  // Order books state - reserved for future implementation
-  // const [orderBooks, setOrderBooks] = useState<Map<string, OrderBook>>(new Map());
   const [klineData, setKlineData] = useState<Map<string, KlineData[]>>(new Map());
   const [isConnected, setIsConnected] = useState(false);
+  
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = useRef(true);
+  const connectingRef = useRef(false);
+  
+  // Use refs for prices to avoid re-renders on every tick
+  const pricesRef = useRef<Map<string, CryptoPair>>(new Map());
+  const pendingUpdateRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Fetch initial 24h ticker data
+  // Batch price updates - only update React state every 1 second max
+  const batchPriceUpdate = useCallback(() => {
+    if (pendingUpdateRef.current) return;
+    
+    pendingUpdateRef.current = setTimeout(() => {
+      if (isMountedRef.current) {
+        setPrices(new Map(pricesRef.current));
+      }
+      pendingUpdateRef.current = null;
+    }, 1000); // Throttle to 1 update per second
+  }, []);
+
   const fetch24hTickers = useCallback(async () => {
     try {
       const response = await fetch(`${BINANCE_API_URL}/ticker/24hr?symbols=${JSON.stringify(CRYPTO_PAIRS)}`);
@@ -48,13 +63,14 @@ export function useBinanceWebSocket() {
           lastUpdate: ticker.closeTime,
         });
       });
+      
+      pricesRef.current = newPrices;
       setPrices(newPrices);
     } catch (error) {
       console.error('Failed to fetch 24h tickers:', error);
     }
   }, []);
 
-  // Fetch historical klines
   const fetchKlines = useCallback(async (symbol: string, interval: string = '1h', limit: number = 100) => {
     try {
       const response = await fetch(`${BINANCE_API_URL}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
@@ -80,53 +96,77 @@ export function useBinanceWebSocket() {
     }
   }, []);
 
-  // Connect to WebSocket
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    // Prevent multiple concurrent connections
+    if (connectingRef.current || wsRef.current?.readyState === WebSocket.OPEN) return;
+    if (!isMountedRef.current) return;
+    
+    connectingRef.current = true;
+    
+    // Clear any existing socket
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.close();
+      wsRef.current = null;
+    }
 
-    // Create combined stream for all pairs
     const streams = CRYPTO_PAIRS.map(s => `${s.toLowerCase()}@ticker`).join('/');
     const ws = new WebSocket(`${BINANCE_WS_URL}/${streams}`);
     
     ws.onopen = () => {
       console.log('Binance WebSocket connected');
-      setIsConnected(true);
+      if (isMountedRef.current) {
+        setIsConnected(true);
+      }
+      connectingRef.current = false;
     };
 
     ws.onmessage = (event) => {
+      if (!isMountedRef.current) return;
+      
       const data = JSON.parse(event.data);
       
       if (data.stream && data.data) {
         const ticker = data.data;
         const symbol = ticker.s;
         
-        setPrices(prev => {
-          const newMap = new Map(prev);
-          
-          newMap.set(symbol, {
-            symbol: symbol,
-            baseAsset: symbol.replace('USDT', ''),
-            quoteAsset: 'USDT',
-            price: parseFloat(ticker.c),
-            priceChange24h: parseFloat(ticker.p),
-            priceChangePercent24h: parseFloat(ticker.P),
-            volume24h: parseFloat(ticker.v),
-            high24h: parseFloat(ticker.h),
-            low24h: parseFloat(ticker.l),
-            lastUpdate: ticker.E,
-          });
-          
-          return newMap;
+        // Update ref immediately (no re-render)
+        pricesRef.current.set(symbol, {
+          symbol: symbol,
+          baseAsset: symbol.replace('USDT', ''),
+          quoteAsset: 'USDT',
+          price: parseFloat(ticker.c),
+          priceChange24h: parseFloat(ticker.p),
+          priceChangePercent24h: parseFloat(ticker.P),
+          volume24h: parseFloat(ticker.v),
+          high24h: parseFloat(ticker.h),
+          low24h: parseFloat(ticker.l),
+          lastUpdate: ticker.E,
         });
+        
+        // Batch React state updates (prevents flickering)
+        batchPriceUpdate();
       }
     };
 
     ws.onclose = () => {
       console.log('Binance WebSocket disconnected');
-      setIsConnected(false);
+      if (isMountedRef.current) {
+        setIsConnected(false);
+      }
+      connectingRef.current = false;
       
-      // Reconnect after 3 seconds
-      reconnectTimeoutRef.current = setTimeout(connect, 3000);
+      // Only reconnect if still mounted
+      if (isMountedRef.current && !reconnectTimeoutRef.current) {
+        reconnectTimeoutRef.current = setTimeout(() => {
+          reconnectTimeoutRef.current = null;
+          if (isMountedRef.current) {
+            connect();
+          }
+        }, 3000);
+      }
     };
 
     ws.onerror = (error) => {
@@ -135,27 +175,30 @@ export function useBinanceWebSocket() {
     };
 
     wsRef.current = ws;
-  }, []);
-
-  // Subscribe to order book depth
-  const subscribeToOrderBook = useCallback((_symbol: string) => {
-    // const streamName = `${symbol.toLowerCase()}@depth20@100ms`;
-    // Note: For combined streams, we'd need to reconnect with new streams
-    // This is simplified for demo purposes
-  }, []);
+  }, [batchPriceUpdate]);
 
   useEffect(() => {
+    isMountedRef.current = true;
+    
     fetch24hTickers();
     connect();
-
-    // Fetch initial klines for all pairs
     CRYPTO_PAIRS.forEach(symbol => fetchKlines(symbol));
 
     return () => {
+      isMountedRef.current = false;
+      
+      if (pendingUpdateRef.current) {
+        clearTimeout(pendingUpdateRef.current);
+      }
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
       }
-      wsRef.current?.close();
+      if (wsRef.current) {
+        wsRef.current.onclose = null; // Prevent reconnect on manual close
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
   }, [fetch24hTickers, connect, fetchKlines]);
 
@@ -164,7 +207,8 @@ export function useBinanceWebSocket() {
     klineData,
     isConnected,
     fetchKlines,
-    subscribeToOrderBook,
+    // Export ref for accessing latest prices without re-render
+    pricesRef,
   };
 }
 
